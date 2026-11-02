@@ -41,3 +41,6 @@ CLAUDE.md
 RELEASE.md
 # Generated differential report
 tests/integration/hledger-conformance/corpus-report.json
+
+# Claude Code worktrees
+.claude/worktrees/
