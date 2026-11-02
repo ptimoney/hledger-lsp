@@ -3,8 +3,7 @@ updates:
   - package-ecosystem: npm
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
@@ -15,7 +14,8 @@ updates:
         applies-to: version-updates
         dependency-type: production
         update-types: [minor, patch]
-      # Toolchain churn (eslint, jest, ts, types) is noisy — one PR a week.
+      # Toolchain churn (eslint, jest, ts, types) is noisy — one PR a month,
+      # auto-merged once CI passes (workflows/dependabot-automerge.yml).
       development:
         applies-to: version-updates
         dependency-type: development
@@ -25,10 +25,10 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
     commit-message:
       prefix: "chore(ci)"
     groups:
+      # Minor/patch auto-merged; action majors arrive as their own PRs.
       actions:
-        patterns: ["*"]
+        update-types: [minor, patch]
