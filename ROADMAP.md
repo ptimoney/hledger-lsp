@@ -1,12 +1,18 @@
 # Roadmap
 
+## In flight
+
+- **Release 0.8.0** (#31 fix): the version commit and the `v0.8.0` tag exist
+  locally. Pushing the tag runs the CI publish job.
+- **#31 follow-ups in the client repos** (separate sessions):
+  - hledger-vscode: drop the stale `.clientrc` watcher; bump to `^0.8.0` once it's
+    on npm (the Dependabot cooldown delays automatic bumps).
+  - hledger-nvim: verify that Neovim advertises dynamic watched-file registration
+    on each platform (likely off on Linux), check end to end, and document it in
+    the README.
+
 ## Next
 
-- **hledger-vscode: drop the stale `.clientrc` watcher** in `extension.ts`
-  (`synchronize.fileEvents`). Since #31 the server registers its own watchers, so
-  that template leftover does nothing useful.
-- **Release** a minor version carrying the #31 fix, then bump `hledger-vscode` and
-  `hledger-nvim` by hand (Dependabot cooldown delays automatic bumps).
 - **assertions-18.j**, the last corpus false positive. It's blocked on the
   one-`Amount`-per-posting model: hledger infers two amounts for one amount-less
   posting. Needs a data-model change.
