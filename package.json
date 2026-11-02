@@ -1,6 +1,6 @@
 {
   "name": "hledger-lsp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Language Server Protocol implementation for hledger plain text accounting",
   "main": "./out/server.js",
   "bin": {
