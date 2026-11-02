@@ -168,9 +168,10 @@ include income.journal`,
     Income:Salary`
       };
 
+      let readable = true;
       const fileReader: FileReader = (uri: URI) => {
         const content = files[uri.toString()];
-        if (content) {
+        if (readable && content) {
           return TextDocument.create(uri.toString(), 'hledger', 1, content);
         }
         return null;
@@ -183,8 +184,11 @@ include income.journal`,
         mockConnection
       );
 
-      // Invalidate the file to clear cache
+      // Invalidate the file to clear cache (unreadable, so invalidateFile's
+      // eager edge refresh can't repopulate it)
+      readable = false;
       manager.invalidateFile(URI.parse('file:///workspace/main.journal'));
+      readable = true;
 
       // getCachedDocument should re-parse the file
       const doc = manager.getCachedDocument(URI.parse('file:///workspace/main.journal'));
@@ -241,11 +245,9 @@ include income.journal`,
         mockConnection
       );
 
-      // Invalidate to clear cache
-      manager.invalidateFile(URI.parse('file:///workspace/main.journal'));
-
-      // Make file reader fail
+      // Make file reader fail, then invalidate to clear cache
       shouldFail = true;
+      manager.invalidateFile(URI.parse('file:///workspace/main.journal'));
 
       const doc = manager.getCachedDocument(URI.parse('file:///workspace/main.journal'));
       expect(doc).toBeNull();
@@ -323,9 +325,9 @@ include income.journal`,
         includeResolver
       );
 
-      // Clear caches and make sub.journal unreadable
-      manager.invalidateFile(URI.parse('file:///workspace/sub.journal'));
+      // Make sub.journal unreadable and clear caches
       failOnSub = true;
+      manager.invalidateFile(URI.parse('file:///workspace/sub.journal'));
 
       // Parse from file should warn about missing document
       manager.parseFromFile(URI.parse('file:///workspace/main.journal'));
@@ -363,9 +365,9 @@ include income.journal`,
         mockConnection
       );
 
-      // Invalidate and make unreadable
-      manager.invalidateFile(URI.parse('file:///workspace/main.journal'));
+      // Make unreadable and invalidate
       allowRead = false;
+      manager.invalidateFile(URI.parse('file:///workspace/main.journal'));
 
       // Parse from file - will try to get cached doc which will fail
       manager.parseFromFile(URI.parse('file:///workspace/main.journal'));

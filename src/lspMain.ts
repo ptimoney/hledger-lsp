@@ -6,6 +6,8 @@ import {
   TextDocumentSyncKind,
   InitializeResult,
   DidChangeConfigurationNotification,
+  DidChangeWatchedFilesNotification,
+  Disposable,
 } from 'vscode-languageserver/node';
 
 import { URI } from 'vscode-uri';
@@ -20,6 +22,7 @@ import { HledgerSettings, defaultSettings, getDocumentSettings as getDocumentSet
 import { defaultFileReader, resolveIncludePath as resolveIncludePathUtil, toFileUri } from './utils/uri';
 import { updateDependencies, clearDependencies, getDependents } from './server/deps';
 import { WorkspaceManager } from './server/workspace';
+import { buildFileWatchers, toJournalFileChanges, CONFIG_FILE_NAME } from './server/fileWatchers';
 import { parseWithWorkspace } from './server/documentParse';
 import * as path from 'path';
 import { FileReader } from './types';
@@ -51,6 +54,9 @@ let hasConfigurationCapability = false;
 let hasDidChangeConfigurationDynamicRegistration = false;
 let hasInlayHintRefreshSupport = false;
 let hasCodeLensRefreshSupport = false;
+let hasWatchedFilesDynamicRegistration = false;
+let hasWatchedFilesRelativePatternSupport = false;
+let watchedFilesRegistration: Promise<Disposable> | null = null;
 
 // Workspace state
 let workspaceFolders: URI[] = [];
@@ -96,6 +102,10 @@ connection.onInitialize((params: InitializeParams) => {
     capabilities.workspace.codeLens.refreshSupport
   );
 
+  hasWatchedFilesDynamicRegistration = !!capabilities.workspace?.didChangeWatchedFiles?.dynamicRegistration;
+  hasWatchedFilesRelativePatternSupport = !!capabilities.workspace?.didChangeWatchedFiles?.relativePatternSupport;
+
+  serverLog.debug(`Watched files dynamic registration: ${hasWatchedFilesDynamicRegistration} (relative patterns: ${hasWatchedFilesRelativePatternSupport})`);
   serverLog.debug(`Inlay hint refresh support: ${hasInlayHintRefreshSupport}`);
   serverLog.debug(`Code lens refresh support: ${hasCodeLensRefreshSupport}`);
   serverLog.debug(`Dynamic registration for didChangeConfiguration: ${hasDidChangeConfigurationDynamicRegistration}`);
@@ -187,16 +197,40 @@ connection.onInitialized(async () => {
 
   // Initialize WorkspaceManager if we have workspace folders
   if (workspaceFolders.length > 0) {
+    // File watchers are registered by initializeWorkspaceManager once the
+    // include patterns from .hledger-lsp.json are known (issue #31).
     await initializeWorkspaceManager(workspaceFolders);
-
-    // Watch for config file changes
-    // Note: Many clients (including Neovim LSP) don't support dynamic file watchers,
-    // so we rely on onDidChangeWatchedFiles being called for any file changes
-    // If the client supports it, the workspace/configuration already watches files
   } else {
     serverLog.log('No workspace folders — WorkspaceManager will be initialized when first document is opened');
   }
 });
+
+/**
+ * Ask the client to watch journal files and the config file, so that changes made
+ * outside the editor reach onDidChangeWatchedFiles. Re-registers (replacing the old
+ * watchers) when the include patterns may have changed, e.g. after a config reload.
+ */
+async function registerFileWatchers(folders: URI[], patterns: string[]): Promise<void> {
+  if (!hasWatchedFilesDynamicRegistration) {
+    serverLog.debug('Client lacks dynamic didChangeWatchedFiles registration — relying on client-side watchers');
+    return;
+  }
+
+  try {
+    if (watchedFilesRegistration) {
+      const previous = watchedFilesRegistration;
+      watchedFilesRegistration = null;
+      (await previous).dispose();
+    }
+    const watchers = buildFileWatchers(folders, patterns, hasWatchedFilesRelativePatternSupport);
+    watchedFilesRegistration = connection.client.register(DidChangeWatchedFilesNotification.type, { watchers });
+    await watchedFilesRegistration;
+    serverLog.log(`Registered ${watchers.length} file watcher(s)`);
+  } catch (error) {
+    watchedFilesRegistration = null;
+    serverLog.warn(`Failed to register file watchers: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 // Helper function to initialize workspace manager
 async function initializeWorkspaceManager(folders: URI[], forceReinit: boolean = false): Promise<void> {
@@ -231,6 +265,8 @@ async function initializeWorkspaceManager(folders: URI[], forceReinit: boolean =
     }
 
     serverLog.log('WorkspaceManager initialized');
+
+    await registerFileWatchers(folders, workspaceManager.getWatchPatterns());
 
     // Refresh all open documents now that workspace context is available
     const openDocuments = documents.all();
@@ -374,22 +410,34 @@ documents.onDidChangeContent(change => {
   }
 });
 
-// Watch for config file changes (.hledger-lsp.json)
+// Watch for config file (.hledger-lsp.json) and journal file changes made outside the editor
 connection.onDidChangeWatchedFiles(async (params) => {
-  for (const change of params.changes) {
-    if (change.uri.endsWith('.hledger-lsp.json')) {
-      serverLog.log(`Config file changed: ${change.uri} — reinitializing workspace`);
+  // A config change rebuilds the whole workspace, which also covers any journal changes
+  const configChange = params.changes.find(change => change.uri.endsWith(CONFIG_FILE_NAME));
+  if (configChange) {
+    serverLog.log(`Config file changed: ${configChange.uri} — reinitializing workspace`);
 
-      // Reinitialize workspace manager with new config
-      if (workspaceFolders.length > 0) {
-        await initializeWorkspaceManager(workspaceFolders, true);
-
-        // Revalidate all open documents with new configuration
-        documents.all().forEach(doc => validateTextDocument(doc, 'config-file-change'));
-      }
-
-      break; // Only reinitialize once even if multiple config files changed
+    // Reinitialize workspace manager with new config (revalidates open documents)
+    if (workspaceFolders.length > 0) {
+      await initializeWorkspaceManager(workspaceFolders, true);
     }
+    return;
+  }
+
+  if (!workspaceManager) return;
+
+  const journalChanges = toJournalFileChanges(params.changes, uri => !!getDocument(uri));
+  if (journalChanges.length === 0) return;
+
+  serverLog.log(`Watched journal file change(s): ${journalChanges.map(c => `${c.type} ${c.uri}`).join(', ')}`);
+  await workspaceManager.applyFileChanges(journalChanges);
+
+  // Any open document may depend on the changed files through the workspace
+  for (const doc of documents.all()) {
+    validateTextDocument(doc, 'watched-file-change');
+  }
+  if (hasInlayHintRefreshSupport) {
+    connection.languages.inlayHint.refresh();
   }
 });
 

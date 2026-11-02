@@ -233,57 +233,77 @@ export class WorkspaceManager {
    * not transitive ones. This ensures the graph accurately represents the include structure.
    */
   private async buildIncludeGraph(): Promise<void> {
+    this.includeGraph.clear();
+    this.reverseGraph.clear();
 
     for (const fileUri of this.journalFiles.values()) {
+      this.updateEdgesFor(fileUri);
+    }
+  }
+
+  /**
+   * (Re)compute the direct include edges of one file, updating both the forward
+   * and reverse graphs. Uses the cached parse when present; otherwise reads and
+   * parses the file (WITHOUT following includes) and caches the result.
+   * Returns true if the file's set of direct includes changed.
+   */
+  private updateEdgesFor(fileUri: URI): boolean {
+    const key = fileUri.toString();
+    const previous = this.includeGraph.get(key);
+    const includedFiles = new Map<string, URI>();
+
+    let parsed = this.documentCache.get(key);
+    if (!parsed) {
       const doc = this.fileReader(fileUri);
-      if (!doc) continue;
-
-      // Parse WITHOUT following includes - we only want direct include directives from this file
-      const parsed = this.parser.parse(doc);
-
-      // Cache the parsed document for later use in workspace merging
-      this.documentCache.set(fileUri.toString(), parsed);
-
-      // Extract include directives from this file only
-      const includeDirectives = parsed.directives.filter(
-        (d: Directive) => d.type === 'include' && d.sourceUri?.toString() === fileUri.toString()
-      );
-
-      // Now resolve each include directive to get the actual file URIs
-      const includedFiles = new Map<string, URI>();
-
-      for (const directive of includeDirectives) {
-        const includePath = directive.value;
-
-        // Use injected resolver if available, otherwise default implementation
-        const resolver = this.includePathResolver ?? resolveIncludePaths;
-        const resolvedPaths = resolver(includePath, fileUri);
-
-        // Add all resolved paths to included files (filter to known workspace files)
-        for (const resolvedUri of resolvedPaths) {
-          if (this.journalFiles.has(resolvedUri.toString())) {
-            includedFiles.set(resolvedUri.toString(), resolvedUri);
-          }
-        }
-      }
-
-      // Update include graph
-      this.includeGraph.set(fileUri.toString(), includedFiles);
-
-      if (includedFiles.size > 0) {
-        wsLog.debug(`${fileUri} directly includes ${includedFiles.size} file(s): ${Array.from(includedFiles.keys()).join(', ')}`);
-      }
-
-      // Update reverse graph
-      for (const [includedString, _includedUri] of includedFiles) {
-        let parents = this.reverseGraph.get(includedString);
-        if (!parents) {
-          parents = new Map<string, URI>();
-          this.reverseGraph.set(includedString, parents);
-        }
-        parents.set(fileUri.toString(), fileUri);
+      if (doc) {
+        parsed = this.parser.parse(doc);
+        this.documentCache.set(key, parsed);
       }
     }
+
+    if (!parsed) {
+      // Unreadable (possibly transiently): keep whatever edges we already have
+      return false;
+    }
+
+    // Extract include directives from this file only
+    const includeDirectives = parsed.directives.filter(
+      (d: Directive) => d.type === 'include' && d.sourceUri?.toString() === key
+    );
+
+    // Use injected resolver if available, otherwise default implementation
+    const resolver = this.includePathResolver ?? resolveIncludePaths;
+    for (const directive of includeDirectives) {
+      // Keep only resolved paths that are known workspace files
+      for (const resolvedUri of resolver(directive.value, fileUri)) {
+        if (this.journalFiles.has(resolvedUri.toString())) {
+          includedFiles.set(resolvedUri.toString(), resolvedUri);
+        }
+      }
+    }
+
+    // Drop this file's old reverse edges, then record the new ones
+    if (previous) {
+      for (const includedString of previous.keys()) {
+        this.reverseGraph.get(includedString)?.delete(key);
+      }
+    }
+    this.includeGraph.set(key, includedFiles);
+    for (const includedString of includedFiles.keys()) {
+      let parents = this.reverseGraph.get(includedString);
+      if (!parents) {
+        parents = new Map<string, URI>();
+        this.reverseGraph.set(includedString, parents);
+      }
+      parents.set(key, fileUri);
+    }
+
+    if (includedFiles.size > 0) {
+      wsLog.debug(`${fileUri} directly includes ${includedFiles.size} file(s): ${Array.from(includedFiles.keys()).join(', ')}`);
+    }
+
+    const prevKeys = previous ? [...previous.keys()] : [];
+    return prevKeys.length !== includedFiles.size || prevKeys.some(k => !includedFiles.has(k));
   }
 
   /**
@@ -627,6 +647,7 @@ export class WorkspaceManager {
    */
   invalidateFile(uri: URI): void {
     const uriString = uri.toString();
+    const wasInWorkspace = !!this.rootFile && this.rootIncludesFile(this.rootFile, uri);
 
     // Clear the per-file document cache entry
     if (this.documentCache.has(uriString)) {
@@ -634,14 +655,83 @@ export class WorkspaceManager {
       wsLog.info(`Cleared document cache for: ${uri}`);
     }
 
-    // If root file includes this file, clear the workspace cache
-    if (this.rootFile && this.rootIncludesFile(this.rootFile, uri)) {
+    // The file's include lines may have changed: refresh its edges (re-parses it)
+    let edgesChanged = false;
+    if (this.journalFiles.has(uriString)) {
+      edgesChanged = this.updateEdgesFor(uri);
+      if (edgesChanged) {
+        wsLog.info(`Include edges changed for: ${uri}`);
+        this.identifyRootFile();
+      }
+    }
+
+    // If the workspace includes (or included) this file, clear the workspace cache
+    const isInWorkspace = !!this.rootFile && this.rootIncludesFile(this.rootFile, uri);
+    if (wasInWorkspace || isInWorkspace || edgesChanged) {
       wsLog.info(`Invalidating workspace cache due to change in: ${uri}`);
       this.workspaceCache = null;
     } else {
       wsLog.info(`File change doesn't affect workspace cache: ${uri}`);
     }
+  }
 
+  /**
+   * Apply file-system changes reported by the client (workspace/didChangeWatchedFiles),
+   * typically for files not open in the editor. Created files are admitted only if they
+   * match the workspace's include/exclude patterns; deleted files leave the workspace.
+   * The include graph and root are refreshed and the workspace cache is cleared.
+   */
+  async applyFileChanges(changes: Array<{ uri: URI; type: 'created' | 'changed' | 'deleted' }>): Promise<void> {
+    let membershipChanged = false;
+
+    for (const { uri, type } of changes) {
+      this.documentCache.delete(uri.toString());
+      if (type === 'deleted' && this.journalFiles.delete(uri.toString())) {
+        membershipChanged = true;
+      }
+    }
+
+    const created = changes.filter(c => c.type === 'created' && !this.journalFiles.has(c.uri.toString()));
+    if (created.length > 0) {
+      const before = this.journalFiles.size;
+      if (this.workspaceFolders.length > 0) {
+        // Re-discover so include/exclude patterns from config are honoured
+        for (const folder of this.workspaceFolders) {
+          for (const file of await this.discoverJournalFiles(folder)) {
+            this.journalFiles.set(file.toString(), file);
+          }
+        }
+      } else {
+        // Workspace built from an explicit file list: admit created files directly
+        for (const { uri } of created) {
+          this.journalFiles.set(uri.toString(), uri);
+        }
+      }
+      membershipChanged = membershipChanged || this.journalFiles.size !== before;
+    }
+
+    if (membershipChanged) {
+      // Other files' include globs may now match (or no longer match) these files
+      await this.buildIncludeGraph();
+    } else {
+      for (const { uri } of changes) {
+        if (this.journalFiles.has(uri.toString())) {
+          this.updateEdgesFor(uri);
+        }
+      }
+    }
+
+    this.identifyRootFile();
+    this.workspaceCache = null;
+    wsLog.info(`Applied ${changes.length} watched-file change(s); workspace cache cleared`);
+  }
+
+  /**
+   * Glob patterns (relative to each workspace folder) the client should watch
+   * so that out-of-editor changes reach applyFileChanges().
+   */
+  getWatchPatterns(): string[] {
+    return this.config?.include ?? ['**/*.journal', '**/*.hledger'];
   }
 
   /**
